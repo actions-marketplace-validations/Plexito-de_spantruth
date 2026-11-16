@@ -6,12 +6,37 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-15
+
 ### Added
 
+- `openai/stream-tool-call` and `anthropic/stream-tool-call` scenarios for parallel tool calls in a
+  stream: streamed deltas and `input_json_delta` chunks with finish reasons `tool_calls` and `tool_use`.
+- A write-up of the double span on the site: one Claude call shows twice its cost when the
+  Anthropic SDK's own tracing and an instrumentation library both report usage.
 - Langfuse Python SDK (`langfuse.openai`) as a subject, reading its native `langfuse.observation.*`
   attributes.
 - `openai/stream-helper` and `openai/async-stream-helper` scenarios for a stream consumed via
   `with_streaming_response.create`.
+- `anthropic/cache-1h` and `anthropic/stream-cache-1h` scenarios for a prompt-cache write with a
+  1-hour part and a 5-minute part. The response carries the `cache_creation` breakdown, so a
+  library that adds the breakdown to the total, or reports one part alone, shows a wrong count.
+  The report names that arithmetic.
+- `openai/cache-write` and `openai/stream-cache-write` scenarios for a prompt-cache write on
+  GPT-5.6, which OpenAI bills at its own rate and reports as `prompt_tokens_details.cache_write_tokens`.
+  The cost figure prices it, with a `gpt-5.6-luna` row in `prices.toml`.
+
+### Changed
+
+- The cost figure prices a 1-hour cache write at its own rate (`cache_write_long` in `prices.toml`,
+  $4.00 per million tokens for Claude Sonnet 5.5). It used the 5-minute rate for every cache
+  write. No scenario sent a 1-hour write before, so no published figure changes.
+- The test suite fails on a fixture whose `usage` has a field the cost figure does not price: a
+  batch, priority or fast tier, US-only inference, an Anthropic web search or code execution,
+  audio tokens, or an OpenAI cache write. The scenario that adds one decides its price first.
+- The test suite fails on a built fixture with a field that the provider's SDK types do not
+  declare. The SDK types accept an unknown field, so such a fixture parsed before.
+- Prices checked against both pricing pages on 2026-11-15.
 
 ## [0.4.2] - 2026-11-06
 
@@ -44,8 +69,6 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- `openai/stream-tool-call` and `anthropic/stream-tool-call` scenarios for parallel tool calls in a stream:
-  streamed deltas and `input_json_delta` chunks with finish reasons `tool_calls` and `tool_use`.
 - `anthropic/thinking` and `anthropic/stream-thinking` scenarios for Anthropic extended thinking:
   a response with thinking content blocks, non-streamed and streamed.
 - Ten named bug classes, `ST01` Ghost span to `ST10` Observer effect, on a new page
@@ -211,7 +234,8 @@ All notable changes to this project are documented here. The format follows
 - Subjects: the OpenTelemetry GenAI instrumentation, OpenLLMetry and OpenInference.
 - A Markdown and a static HTML report.
 
-[Unreleased]: https://github.com/Plexito-de/spantruth/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Plexito-de/spantruth/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Plexito-de/spantruth/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Plexito-de/spantruth/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Plexito-de/spantruth/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Plexito-de/spantruth/compare/v0.3.0...v0.4.0

@@ -184,3 +184,200 @@ def test_a_ghost_span_figure_needs_the_ghost_check():
     checks = [check("span.ended", "lost"), check("output_tokens", "wrong", 419, 420)]
     assert impact.class_cost(wire, checks, "ST01").percent == -100
     assert impact.class_cost(wire, checks, "ST04").percent < 1
+
+
+def test_cost_prices_one_hour_writes_at_their_own_rate():
+    wire = truth(
+        input_tokens=6288,
+        output_tokens=389,
+        cache_read_tokens=2861,
+        cache_write_tokens=2120,
+        cache_write_long_tokens=1663,
+    )
+    checks = [
+        check("input_tokens", "pass", 6288, 6288),
+        check("output_tokens", "pass", 389, 389),
+        check("cache_read_tokens", "pass", 2861, 2861),
+        check("cache_write_tokens", "pass", 2120, 2120),
+    ]
+    result = impact.cell_cost(wire, checks)
+    # 1307 uncached at $2, 2861 read at $0.10, 457 written for 5 minutes at $2.50,
+    # 1663 written for 1 hour at $4, 389 output at $10, per million.
+    assert result.real == pytest.approx(
+        (1307 * 2 + 2861 * 0.10 + 457 * 2.50 + 1663 * 4 + 389 * 10) / 1_000_000
+    )
+    assert result.percent == 0
+
+
+def test_a_missing_write_loses_its_one_hour_price():
+    wire = truth(
+        input_tokens=6288,
+        output_tokens=389,
+        cache_read_tokens=2861,
+        cache_write_tokens=2120,
+        cache_write_long_tokens=1663,
+    )
+    checks = [
+        check("input_tokens", "pass", 6288, 6288),
+        check("output_tokens", "pass", 389, 389),
+        check("cache_read_tokens", "pass", 2861, 2861),
+        check("cache_write_tokens", "missing", 2120),
+    ]
+    result = impact.cell_cost(wire, checks)
+    # The dashboard prices the 2120 written tokens as uncached input at $2.
+    lost = 457 * (2.50 - 2) + 1663 * (4 - 2)
+    assert result.real - result.reported == pytest.approx(lost / 1_000_000)
+
+
+def test_a_wrong_write_count_keeps_the_wire_share_of_one_hour_writes():
+    wire = truth(
+        input_tokens=6288,
+        output_tokens=389,
+        cache_write_tokens=2120,
+        cache_write_long_tokens=1060,
+    )
+    checks = [
+        check("input_tokens", "pass", 6288, 6288),
+        check("output_tokens", "pass", 389, 389),
+        check("cache_write_tokens", "wrong", 2120, 4240),
+    ]
+    # Twice the writes, half of them for 1 hour: 2120 at $2.50 and 2120 at $4. That leaves 2048
+    # uncached at $2.
+    shown = (2048 * 2 + 2120 * 2.50 + 2120 * 4 + 389 * 10) / 1_000_000
+    assert impact.cell_cost(wire, checks).reported == pytest.approx(shown)
+
+
+def test_every_model_has_a_one_hour_write_price_at_least_the_five_minute_one():
+    for price in impact.load_prices().values():
+        assert price.cache_write_long >= price.cache_write
+
+
+ANTHROPIC_USAGE = {
+    "input_tokens": 1307,
+    "output_tokens": 389,
+    "cache_read_input_tokens": 2861,
+    "cache_creation_input_tokens": 2120,
+    "cache_creation": {"ephemeral_5m_input_tokens": 457, "ephemeral_1h_input_tokens": 1663},
+    "output_tokens_details": {"thinking_tokens": 211},
+}
+OPENAI_USAGE = {
+    "prompt_tokens": 5379,
+    "completion_tokens": 377,
+    "total_tokens": 5756,
+    "prompt_tokens_details": {"cached_tokens": 4096, "audio_tokens": 0},
+    "completion_tokens_details": {"reasoning_tokens": 64, "rejected_prediction_tokens": 12},
+}
+
+
+@pytest.mark.parametrize(
+    ("provider", "response"),
+    [
+        ("anthropic", {"usage": ANTHROPIC_USAGE}),
+        # The tiers and the server tools at their standard values, as the API sends them.
+        (
+            "anthropic",
+            {
+                "usage": ANTHROPIC_USAGE
+                | {
+                    "service_tier": "standard",
+                    "inference_geo": "global",
+                    "speed": "standard",
+                    "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                }
+            },
+        ),
+        ("anthropic", {"usage": ANTHROPIC_USAGE | {"service_tier": None, "speed": None}}),
+        ("openai", {"service_tier": "default", "usage": OPENAI_USAGE}),
+        ("openai", {"usage": OPENAI_USAGE}),
+        # A chunk before the usage chunk bills nothing, so its tier says nothing yet.
+        ("openai", {"service_tier": "auto", "usage": None}),
+    ],
+)
+def test_a_call_at_the_standard_rates_has_no_unpriced_field(provider, response):
+    assert impact.unpriced(provider, response) == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "response", "named"),
+    [
+        ("anthropic", {"usage": ANTHROPIC_USAGE | {"service_tier": "batch"}}, "service_tier"),
+        ("anthropic", {"usage": ANTHROPIC_USAGE | {"service_tier": "priority"}}, "service_tier"),
+        ("anthropic", {"usage": ANTHROPIC_USAGE | {"inference_geo": "us"}}, "inference_geo"),
+        ("anthropic", {"usage": ANTHROPIC_USAGE | {"speed": "fast"}}, "speed"),
+        (
+            "anthropic",
+            {"usage": ANTHROPIC_USAGE | {"server_tool_use": {"web_search_requests": 2}}},
+            "server_tool_use.web_search_requests",
+        ),
+        ("openai", {"service_tier": "flex", "usage": OPENAI_USAGE}, "service_tier"),
+        ("openai", {"service_tier": "priority", "usage": OPENAI_USAGE}, "service_tier"),
+        (
+            "openai",
+            {"usage": OPENAI_USAGE | {"prompt_tokens_details": {"audio_tokens": 40}}},
+            "prompt_tokens_details.audio_tokens",
+        ),
+        (
+            "openai",
+            {"usage": {"input_tokens": 90, "input_tokens_details": {"cache_write_tokens": 70}}},
+            "input_tokens_details.cache_write_tokens",
+        ),
+        ("openai", {"usage": OPENAI_USAGE | {"a_field_of_next_year": 5}}, "a_field_of_next_year"),
+    ],
+)
+def test_a_field_that_changes_the_price_is_named(provider, response, named):
+    assert [field.split("=")[0] for field in impact.unpriced(provider, response)] == [named]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        # A web fetch bills through its tokens only.
+        {"server_tool_use": {"web_fetch_requests": 3, "web_search_requests": 0}},
+        {"iterations": []},
+    ],
+)
+def test_a_field_with_no_charge_of_its_own_is_not_named(extra):
+    assert impact.unpriced("anthropic", {"usage": ANTHROPIC_USAGE | extra}) == []
+
+
+def test_code_execution_is_named_because_it_bills_by_time():
+    usage = ANTHROPIC_USAGE | {"server_tool_use": {"code_execution_requests": 1}}
+    assert impact.unpriced("anthropic", {"usage": usage}) == [
+        "server_tool_use.code_execution_requests=1"
+    ]
+
+
+def test_a_provider_with_no_price_rules_is_an_error_that_says_so():
+    with pytest.raises(ValueError, match="gemini"):
+        impact.unpriced("gemini", {"usage": {"promptTokenCount": 5}})
+
+
+def test_an_openai_cache_write_is_priced_at_its_own_rate():
+    wire = {
+        "request_model": "gpt-5.6-luna",
+        "error": None,
+        "input_tokens": 6619,
+        "output_tokens": 401,
+        "cache_read_tokens": 2753,
+        "cache_write_tokens": 3181,
+    }
+    checks = [
+        check("input_tokens", "pass", 6619, 6619),
+        check("output_tokens", "pass", 401, 401),
+        check("cache_read_tokens", "pass", 2753, 2753),
+        check("cache_write_tokens", "missing", 3181),
+    ]
+    result = impact.cell_cost(wire, checks)
+    # 685 uncached at $0.20, 2753 read at $0.02, 3181 written at $0.25, 401 output at $1.20.
+    assert result.real == pytest.approx(
+        (685 * 0.20 + 2753 * 0.02 + 3181 * 0.25 + 401 * 1.20) / 1_000_000
+    )
+    # A missing write count prices the 3181 tokens as uncached input instead.
+    assert result.real - result.reported == pytest.approx(3181 * (0.25 - 0.20) / 1_000_000)
+
+
+def test_a_chat_completions_cache_write_count_is_priced():
+    usage = OPENAI_USAGE | {
+        "prompt_tokens_details": {"cached_tokens": 4096, "cache_write_tokens": 7}
+    }
+    assert impact.unpriced("openai", {"usage": usage}) == []

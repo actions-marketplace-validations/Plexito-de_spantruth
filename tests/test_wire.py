@@ -9,42 +9,117 @@ import openai.types.responses
 import pydantic
 import pytest
 
-from spantruth import calls, scenarios
+from spantruth import calls, impact, scenarios
+from spantruth import wire_anthropic as an
 from spantruth.mockserver import MockServer
-from spantruth.model import Response
+from spantruth.model import Event, Response
 
 ALL = list(scenarios.SCENARIOS.values())
+# A recording is a real provider stream, and the provider can be ahead of the SDK's types.
+RECORDED = {s.id for s in scenarios._recorded()}
 ANTHROPIC_EVENT = pydantic.TypeAdapter(anthropic.types.RawMessageStreamEvent)
 RESPONSES_EVENT = pydantic.TypeAdapter(openai.types.responses.ResponseStreamEvent)
 
 
+def _undeclared(parsed, path=""):
+    """The fields of a parsed fixture that its SDK type does not declare, as dotted paths.
+
+    The SDK types accept a field they do not know and keep it aside. So a fixture with an invented
+    field still parses, and only this list shows it.
+    """
+    found = []
+    if isinstance(parsed, pydantic.BaseModel):
+        found += [f"{path}{name}" for name in parsed.model_extra or {}]
+        for name in parsed.model_fields_set:
+            found += _undeclared(getattr(parsed, name, None), f"{path}{name}.")
+    elif isinstance(parsed, (list, tuple)):
+        for index, item in enumerate(parsed):
+            found += _undeclared(item, f"{path}{index}.")
+    elif isinstance(parsed, dict):
+        for name, item in parsed.items():
+            found += _undeclared(item, f"{path}{name}.")
+    return sorted(found)
+
+
 @pytest.mark.parametrize("sc", ALL, ids=lambda s: s.id)
 def test_fixtures_parse_with_sdk_types(sc):
+    parsed = []
     for r in sc.responses:
         if r.status >= 400:
             assert r.body is not None and "error" in r.body
             continue
         if sc.api == "responses":
             for e in r.events or ():
-                assert RESPONSES_EVENT.validate_python(json.loads(e.data)).type == e.event
+                parsed.append(RESPONSES_EVENT.validate_python(json.loads(e.data)))
+                assert parsed[-1].type == e.event
         elif sc.provider == "openai":
             if r.body is not None:
-                openai.types.chat.ChatCompletion.model_validate(r.body, strict=False)
+                parsed.append(openai.types.chat.ChatCompletion.model_validate(r.body, strict=False))
             for e in r.events or ():
                 if isinstance(e.data, dict):
-                    openai.types.chat.ChatCompletionChunk.model_validate(e.data)
+                    parsed.append(openai.types.chat.ChatCompletionChunk.model_validate(e.data))
                 else:
                     assert e.data == "[DONE]"
         else:
             if r.body is not None:
-                anthropic.types.Message.model_validate(r.body)
+                parsed.append(anthropic.types.Message.model_validate(r.body))
             for e in r.events or ():
                 if e.event == "error":
                     # Not a RawMessageStreamEvent: the SDK raises on it before parsing.
                     assert e.data["error"]["type"] in {"overloaded_error", "api_error"}
                     continue
-                parsed = ANTHROPIC_EVENT.validate_python(e.data)
-                assert parsed.type == e.event
+                parsed.append(ANTHROPIC_EVENT.validate_python(e.data))
+                assert parsed[-1].type == e.event
+    if sc.id not in RECORDED:
+        assert _undeclared(parsed) == [], f"{sc.id} sends fields the SDK types do not declare"
+
+
+def test_the_fixture_check_sees_a_field_the_sdk_type_does_not_declare():
+    body = scenarios.get("anthropic/cache-1h").response.body
+    ttl = body["usage"]["cache_creation"] | {"ephemeral_2h_input_tokens": 1}
+    invented = body | {"usage": body["usage"] | {"cache_creation": ttl}}
+    parsed = anthropic.types.Message.model_validate(invented)
+    assert _undeclared(parsed) == ["usage.cache_creation.ephemeral_2h_input_tokens"]
+
+
+def test_a_cumulative_stream_keeps_the_ttl_breakdown_in_message_start():
+    # `message_delta` repeats the counts, but its usage type has no `cache_creation`.
+    response = an.events(
+        id="msg_wt_probe",
+        model="claude-sonnet-5-5-20260915",
+        parts=("Paris.",),
+        stop="end_turn",
+        input_tokens=1009,
+        output_tokens=211,
+        cache_read=307,
+        cache_write=401,
+        cache_write_1h=283,
+        cumulative_delta=True,
+    )
+    for e in response.events:
+        assert _undeclared(ANTHROPIC_EVENT.validate_python(e.data)) == [], e.event
+    start = response.events[0].data["message"]["usage"]
+    assert start["cache_creation"] == {
+        "ephemeral_5m_input_tokens": 118,
+        "ephemeral_1h_input_tokens": 283,
+    }
+    delta = next(e.data for e in response.events if e.event == "message_delta")
+    assert delta["usage"]["cache_creation_input_tokens"] == 401
+
+
+@pytest.mark.parametrize("long_part", [-1, 402])
+def test_the_one_hour_part_of_a_fixture_stays_inside_the_cache_write(long_part):
+    with pytest.raises(ValueError, match="cache_write"):
+        an.message(
+            id="msg_wt_probe",
+            model="claude-sonnet-5-5-20260915",
+            text="Paris.",
+            stop="end_turn",
+            input_tokens=1009,
+            output_tokens=211,
+            cache_write=401,
+            cache_write_1h=long_part,
+        )
 
 
 @pytest.mark.parametrize("sc", ALL, ids=lambda s: s.id)
@@ -61,6 +136,10 @@ def test_fixture_truth_values_are_distinct(sc):
         )
         if v is not None
     ]
+    long_write = t.cache_write_long_tokens
+    if long_write and long_write != t.cache_write_tokens:
+        # The two parts of a cache write. A library can report one of them alone.
+        values += [long_write, t.cache_write_tokens - long_write]
     assert len(values) == len(set(values)), f"{sc.id} repeats a token value: {values}"
     if t.response_model is not None:
         assert t.response_model != t.request_model
@@ -222,3 +301,82 @@ def test_stream_helper_goes_through_with_streaming_response(monkeypatch, sid, ta
     with MockServer() as mock:
         calls.run(sc, mock.base_url(sc), calls.Seen())
     assert sent == ["stream"]
+
+
+@pytest.mark.parametrize(
+    ("sid", "tokens"),
+    [
+        ("anthropic/cache-1h", (6288, 2861, 2120, 1663)),
+        ("anthropic/stream-cache-1h", (7160, 3217, 2492, 1879)),
+    ],
+)
+def test_anthropic_truth_reads_the_one_hour_share_of_cache_writes(sid, tokens):
+    t = scenarios.truth(scenarios.get(sid))
+    assert (
+        t.input_tokens,
+        t.cache_read_tokens,
+        t.cache_write_tokens,
+        t.cache_write_long_tokens,
+    ) == tokens
+
+
+def test_a_fixture_without_a_ttl_breakdown_has_no_one_hour_writes():
+    assert scenarios.truth(scenarios.get("anthropic/cache-hit")).cache_write_long_tokens is None
+
+
+def _billed(response):
+    """Every object of a fixture that holds a `usage`: a body, an event, or an event's message."""
+    if response.body is not None:
+        yield response.body
+    for e in response.events or ():
+        data = e.data
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except ValueError:  # OpenAI ends a stream with the plain text `[DONE]`
+                continue
+        if isinstance(data, dict):
+            # Anthropic's message_start holds a message, a Responses event holds a response.
+            yield from (data, data.get("message") or {}, data.get("response") or {})
+
+
+@pytest.mark.parametrize("sc", ALL, ids=lambda s: s.id)
+def test_no_fixture_sends_a_field_the_cost_figure_does_not_price(sc):
+    holders = [h for r in sc.responses for h in _billed(r) if isinstance(h.get("usage"), dict)]
+    if scenarios.truth(sc).input_tokens is not None:
+        assert holders, f"{sc.id} has token counts, but this test found no usage to read"
+    for holder in holders:
+        assert impact.unpriced(sc.provider, holder) == [], (
+            f"{sc.id} sends fields that change the price and that impact.py does not price. "
+            "Decide what each one does to a cost figure, then teach impact.py."
+        )
+
+
+def test_the_price_guard_reads_a_usage_inside_json_text():
+    # A recorded fixture keeps its events as JSON text. A guard that skipped text would pass on
+    # any recorded stream, whatever its tier.
+    completed = {
+        "type": "response.completed",
+        "response": {"service_tier": "priority", "usage": {"input_tokens": 9, "output_tokens": 3}},
+    }
+    response = Response(events=(Event(json.dumps(completed), event="response.completed"),))
+    found = [impact.unpriced("openai", h) for h in _billed(response)]
+    assert ["service_tier='priority'"] in found
+
+
+@pytest.mark.parametrize(
+    ("sid", "tokens"),
+    [
+        ("openai/cache-write", (6619, 2753, 3181)),
+        ("openai/stream-cache-write", (8237, 3967, 3539)),
+    ],
+)
+def test_openai_prompt_tokens_include_cache_reads_and_writes(sid, tokens):
+    t = scenarios.truth(scenarios.get(sid))
+    assert (t.input_tokens, t.cache_read_tokens, t.cache_write_tokens) == tokens
+    assert t.cache_write_long_tokens is None  # Chat Completions has no 12-hour lifetime
+    assert scenarios.get(sid).request_model == "gpt-5.6-luna"
+
+
+def test_an_openai_fixture_without_cache_writes_has_none():
+    assert scenarios.truth(scenarios.get("openai/cache-hit")).cache_write_tokens is None
